@@ -22,4 +22,10 @@ go_binary(
     embed = [":go_default_library"],
     visibility = ["//visibility:public"],
     pure = "on",
+    gc_linkopts = [
+    #  "-linkmode",
+    #  "external",
+      "-extldflags",
+      "-static",
+    ],
 )
