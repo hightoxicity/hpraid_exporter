@@ -19,6 +19,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -100,8 +101,9 @@ func (m *Message) Collect(devicePrefix string, ch chan<- prometheus.Metric) {
 // RAID hardware. It then converts the diagnostic report into Prometheus
 // metrics.
 type HpraidExporter struct {
-	collectLock sync.Mutex
-	utilityPath string
+	collectLock     sync.Mutex
+	utilityPath     string
+	tidyUtilityPath string
 }
 
 // Describe metrics provided by the HP RAID exporter.
@@ -110,7 +112,7 @@ func (e *HpraidExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- hpraidErrorsDesc
 }
 
-func collectFromUtility(utilityPath string, ch chan<- prometheus.Metric) error {
+func collectFromUtility(utilityPath string, tidyUtilityPath string, ch chan<- prometheus.Metric) error {
 	tempDir, err := ioutil.TempDir("", "hpraid")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary zip path: %s", err)
@@ -140,18 +142,46 @@ func collectFromUtility(utilityPath string, ch chan<- prometheus.Metric) error {
 		return errors.New("Zip file does not contain ADUReport.xml")
 	}
 
-	// Parse the XML data.
 	reader, err := xmlFile.Open()
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
-	xmlDecoder := xml.NewDecoder(reader)
+
+	extractedXmlFile, err := ioutil.TempFile(tempDir, "ADUReport.xml")
+	if err != nil {
+		return err
+	}
+	defer extractedXmlFile.Close()
+	defer os.Remove(extractedXmlFile.Name())
+
+	_, err = io.Copy(extractedXmlFile, reader)
+
+	tidyXmlFile, err := ioutil.TempFile(tempDir, "ADUReport-tidy.xml")
+	if err != nil {
+		return err
+	}
+	tidyXmlFile.Close()
+	defer os.Remove(tidyXmlFile.Name())
+
+	tidyCmd := exec.Command(tidyUtilityPath, "-q", "-xml", "-o", tidyXmlFile.Name(), extractedXmlFile.Name())
+	if err := tidyCmd.Run(); err != nil {
+		return err
+	}
+
+	tidyReader, err := os.Open(tidyXmlFile.Name())
+
+	if err != nil {
+		return err
+	}
+
+	xmlDecoder := xml.NewDecoder(tidyReader)
 	var report ADUReport
 	err = xmlDecoder.Decode(&report)
 	if err != nil {
 		return err
 	}
+	tidyReader.Close()
 
 	// Extract Prometheus metrics from the report.
 	report.Collect(ch)
@@ -161,7 +191,7 @@ func collectFromUtility(utilityPath string, ch chan<- prometheus.Metric) error {
 // Collect metrics from HP RAID hardware.
 func (e *HpraidExporter) Collect(ch chan<- prometheus.Metric) {
 	e.collectLock.Lock()
-	err := collectFromUtility(e.utilityPath, ch)
+	err := collectFromUtility(e.utilityPath, e.tidyUtilityPath, ch)
 	e.collectLock.Unlock()
 	if err == nil {
 		ch <- prometheus.MustNewConstMetric(
@@ -173,23 +203,25 @@ func (e *HpraidExporter) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func newHpraidExporter(utilityPath string) (*HpraidExporter, error) {
+func newHpraidExporter(utilityPath string, tidyUtilityPath string) (*HpraidExporter, error) {
 	return &HpraidExporter{
-		utilityPath: utilityPath,
+		utilityPath:     utilityPath,
+		tidyUtilityPath: tidyUtilityPath,
 	}, nil
 }
 
 func main() {
 	var (
-		listenAddress = flag.String("web.listen-address", ":9423", "Address to listen on for web interface and telemetry.")
-		metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
-		utilityPath   = flag.String("hpraid.utility-path", "ssacli", "Path of the ssacli utility.")
+		listenAddress   = flag.String("web.listen-address", ":9423", "Address to listen on for web interface and telemetry.")
+		metricsPath     = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
+		utilityPath     = flag.String("hpraid.utility-path", "ssacli", "Path of the ssacli utility.")
+		tidyUtilityPath = flag.String("tidy.utility-path", "tidy", "Path of tidy")
 	)
 	flag.Parse()
 
 	log.Info("Starting hpraid_exporter")
 
-	exporter, err := newHpraidExporter(*utilityPath)
+	exporter, err := newHpraidExporter(*utilityPath, *tidyUtilityPath)
 	if err != nil {
 		panic(err)
 	}
